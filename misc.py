@@ -95,7 +95,7 @@ def gp_nll(K_cov, z, Fourier = False):
         for ii in range(zDim):
             zonedim = z[:,:,ii].unsqueeze(2)
             zonedim_transposed = torch.transpose(zonedim, 1, 2)
-            log_prior +=  0.5 * K_cov.shape[0]*torch.log(torch.Tensor([2*np.pi])) + 0.5 *torch.matmul(zonedim_transposed, torch.matmul(K_inverse, zonedim)) + torch.linalg.slogdet(K_cov)[1]
+            log_prior +=  0.5 * K_cov.shape[0]*torch.log(torch.tensor(2*np.pi, device=K_cov.device)) + 0.5 *torch.matmul(zonedim_transposed, torch.matmul(K_inverse, zonedim)) + torch.linalg.slogdet(K_cov)[1]
 
         log_prior = log_prior
     return log_prior
@@ -687,6 +687,111 @@ def regressions_main_alternative(net_encode, net_decode,n_encode, n_decode, data
 
 
     plt.show()
+
+def sample_latents(z_m, z_logvar):
+    """
+    Standard reparameterization:
+    z = mu + eps * exp(0.5 * logvar)
+    z_m, z_logvar: (B, T, N_tot)
+    """
+    eps = torch.randn_like(z_logvar)
+    z = z_m + eps * torch.exp(0.5 * z_logvar)
+    return z
+
+def visualize_latents_two_region(
+        net_encode, net_decode, 
+        n_encode, n_decode, 
+        data_loader,
+        num_trials=3,
+        Fourier=False
+    ):
+    """
+    Visualizes shared + private latents for the TWO-LFP MM-GPVAE.
+    """
+
+    # ---- get one batch ----
+    for reg1, reg2 in data_loader:
+        batch_reg1 = reg1.float()
+        batch_reg2 = reg2.float()
+        break
+
+    B = batch_reg1.shape[0]
+    assert B >= num_trials, "Batch too small for visualization."
+
+    device = next(net_encode.parameters()).device
+    batch_reg1 = batch_reg1.to(device)
+    batch_reg2 = batch_reg2.to(device)
+
+    # ---- encode ----
+    embs_m_n, embs_s_n = n_encode(batch_reg2, Fourier=Fourier)
+    embs_m_img, embs_s_img = net_encode(batch_reg1, Fourier=Fourier)
+
+    # ---- fuse shared + private ----
+    z_m_tot, z_logvar_tot = return_partitioned_latents(
+        neural_embeds_m = embs_m_n,
+        image_embeds_m  = embs_m_img,
+        neural_embeds_s = embs_s_n,
+        image_embeds_s  = embs_s_img,
+        N_lats_spikes   = N_lats_spikes,
+        N_lats_img      = N_lats_img,
+        N_shared        = N_shared
+    )
+
+    # ---- sample ----
+    z_tot = sample_latents(z_m_tot, z_logvar_tot)    # (B, T, N_tot)
+
+    # ---- split latents ----
+    N_tot = N_lats_img + N_lats_spikes - N_shared
+    priv1_dim = N_lats_img - N_shared
+    priv2_dim = N_lats_spikes - N_shared
+
+    z_shared = z_tot[:, :, :N_shared]                         # (B,T,N_shared)
+    z_priv1  = z_tot[:, :, N_shared:N_shared+priv1_dim]       # (B,T,priv1)
+    z_priv2  = z_tot[:, :, N_shared+priv1_dim:]               # (B,T,priv2)
+
+    T = z_tot.shape[1]
+
+    # ---- plot ----
+    fig, axs = plt.subplots(3, 1, figsize=(14, 12))
+
+    trial = 0  # show first example for clarity
+
+    # shared latents
+    for k in range(N_shared):
+        axs[0].plot(
+            z_shared[trial, :, k].detach().cpu().numpy(),
+            label=f"shared {k}"
+        )
+    axs[0].set_title("Shared Latents (Region1 & Region2)")
+    axs[0].legend()
+
+    # private region 1
+    for k in range(priv1_dim):
+        axs[1].plot(
+            z_priv1[trial, :, k].detach().cpu().numpy(),
+            label=f"priv1 {k}"
+        )
+    axs[1].set_title("Region-1 Private Latents")
+    axs[1].legend()
+
+    # private region 2
+    for k in range(priv2_dim):
+        axs[2].plot(
+            z_priv2[trial, :, k].detach().cpu().numpy(),
+            label=f"priv2 {k}"
+        )
+    axs[2].set_title("Region-2 Private Latents")
+    axs[2].legend()
+
+    plt.show()
+
+    return {
+        "shared": z_shared.detach().cpu(),
+        "priv1": z_priv1.detach().cpu(),
+        "priv2": z_priv2.detach().cpu(),
+    }
+
+
 
 
 class TimePointCustomDataset(Dataset):

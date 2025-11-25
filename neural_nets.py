@@ -204,6 +204,121 @@ class Spike_Decode(nn.Module):
         neural_loss = self.pois_loglike(lambda_hat, spikes)       
         return neural_loss,lambda_hat
         
+
+###############################################################################
+## LFP Encoder
+###############################################################################
+
+class LFP_Encode(nn.Module):
+    def __init__(self, zDim, n_channels, time_points, condthresh=1e8, minlens=None, Fourier=False):
+        super().__init__()
+        torch.manual_seed(my_seed)
+        np.random.seed(my_seed)
+
+        self.N = time_points       # e.g. 250
+        self.zDim = zDim
+        self.n_channels = n_channels  # e.g. 8
+
+        # MLP over channels; applied independently at each timepoint
+        self.en1 = nn.Linear(n_channels, 80)
+        self.en2 = nn.Linear(80, 40)
+        self.en3 = nn.Linear(40, 20)
+
+        # mean and log-variance of latent
+        self.en4 = nn.Linear(20, zDim)
+        self.en5 = nn.Linear(20, zDim)
+
+        # you can ignore Fourier here (leave it False)
+        self.Fourier = Fourier
+
+    def encode(self, lfp_flat):
+        # lfp_flat: (batch*T, C)
+        h = F.elu(self.en1(lfp_flat))
+        h = F.elu(self.en2(h))
+        h = F.elu(self.en3(h))
+
+        zm = self.en4(h)   # (batch*T, zDim)
+        zs = self.en5(h)   # (batch*T, zDim) – log std or raw scale, depending on GP code
+        return zm, zs
+
+    def forward(self, lfp, eps=None, Fourier=False):
+        """
+        lfp: (batch, C, T) or (batch, T, C) – we'll assume (batch, C, T) and transpose.
+        """
+        # if input is (B, C, T), transpose to (B, T, C)
+        if lfp.dim() == 3 and lfp.shape[1] == self.n_channels:
+            lfp = lfp.transpose(1, 2)  # (B, T, C)
+
+        B, T, C = lfp.shape
+        assert T == self.N and C == self.n_channels
+
+        lfp_flat = lfp.reshape(B * T, C)  # (B*T, C)
+        zm_flat, zs_flat = self.encode(lfp_flat)
+
+        # reshape back to (B, T, zDim) because GP prior is over time
+        zm = zm_flat.reshape(B, T, self.zDim)
+        zs = zs_flat.reshape(B, T, self.zDim)
+        return zm, zs
+
+
+###############################################################################
+## LFP Decoder
+###############################################################################
+
+class LFP_Decode(nn.Module):
+    def __init__(self, zDim, n_channels, time_points, init_logvar=-1.0):
+        super().__init__()
+        torch.manual_seed(my_seed)
+        np.random.seed(my_seed)
+
+        self.zDim = zDim
+        self.n_channels = n_channels
+        self.N = time_points
+
+        # Linear from latent to channels, applied per timepoint
+        self.dec = nn.Linear(zDim, n_channels)
+
+        # One variance per channel (you can also make it scalar)
+        self.logvar = nn.Parameter(torch.full((n_channels,), init_logvar))
+
+    def decode_mean(self, z):
+        """
+        z: (B, T, zDim)
+        returns mu: (B, T, C)
+        """
+        B, T, D = z.shape
+        z_flat = z.reshape(B * T, D)        # (B*T, zDim)
+        mu_flat = self.dec(z_flat)          # (B*T, C)
+        mu = mu_flat.reshape(B, T, self.n_channels)
+        return mu
+
+    def gauss_nll(self, lfp, mu):
+        """
+        lfp, mu: (B, T, C)
+        returns: (B,) negative log-likelihood
+        """
+        # broadcast logvar: (1, 1, C)
+        logvar = self.logvar.view(1, 1, -1)
+        var = torch.exp(logvar)
+
+        nll = 0.5 * (((lfp - mu) ** 2) / var + logvar + np.log(2 * np.pi))
+        # sum over time and channels
+        nll = nll.sum(dim=[1, 2])   # (B,)
+        return nll
+
+    def forward(self, z, lfp, Fourier=True):
+        """
+        z: (B, T, zDim)
+        lfp: (B, C, T) or (B, T, C)
+        """
+        # ensure (B, T, C)
+        if lfp.dim() == 3 and lfp.shape[1] == self.n_channels:
+            lfp = lfp.transpose(1, 2)  # (B, T, C)
+
+        mu = self.decode_mean(z)        # (B, T, C)
+        neural_loss = self.gauss_nll(lfp, mu)
+        return neural_loss, mu
+
   
 ###############################################################################
 ## Behavior Encoder + Decoder

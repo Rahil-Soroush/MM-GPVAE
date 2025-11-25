@@ -1351,3 +1351,224 @@ def train_mmgpvae_main_alternative(net_encode, net_decode, n_encode, n_decode, d
         plt.show()
         
     return losses
+
+def sample_latents(z_m, z_logvar):
+    """
+    Standard reparameterization:
+    z = mu + eps * exp(0.5 * logvar)
+    z_m, z_logvar: (B, T, N_tot)
+    """
+    eps = torch.randn_like(z_logvar)
+    z = z_m + eps * torch.exp(0.5 * z_logvar)
+    return z
+
+
+def gp_make_cov_time(T, len_sc=30.0, eps=1e-4, device=None):
+    """
+    Simple SE kernel over time: K[t1,t2] = exp(-(t1-t2)^2 / (2*len_sc^2)) + eps*I
+    This plays the same role as Behavior_Encoder.gp_make_cov (Fourier=False).
+    """
+    if device is None:
+        device = torch.device('cpu')
+    t = torch.arange(T, device=device).float()
+    M1 = t[None, :] - t[:, None]  # (T, T)
+    K_cov = torch.exp(- (M1 ** 2) / (2.0 * (len_sc ** 2))) + eps * torch.eye(T, device=device)
+    return K_cov
+
+
+
+def train_mmgpvae_two_region(net_encode, net_decode, n_encode, n_decode, data_load,
+                             EPOCH=650, lr1=0.00016, lr2=0.00016, lr3=0.000772, lr4=0.0088,
+                             Fourier=False, visualize_ELBO=True):
+    """
+    The training loop:
+
+    encodes both modalities to means & logvars,
+    fuses them into shared + private latents using return_partitioned_latents (unchanged MM-GPVAE logic),
+    samples z_tot via reparameterization,
+    applies a GP prior over time using an SE kernel (like original, but now implemented as a helper),
+    uses Gaussian likelihoods for both modalities,
+    builds an ELBO consisting of: pen_term + neural_loss + recon_term + gpNLL.
+    This is exactly what you wanted conceptually:
+    “What if both heads were neural (here: LFP), with GP prior over shared/private latents and multimodal fusion, like MM-GPVAE?”
+    You’re not using the Behavior_Encoder class anymore, but you are preserving the core components that matter for a fair comparison:
+    multimodal latent fusion with shared and private blocks,
+    GP prior on temporal latent structure,
+    variational ELBO training.
+    In the paper, you can be transparent and call this:
+    “MM-GPVAE (neural–neural LFP variant)” following Gondur et al., with the behavioral observation model replaced by a second neural observation model, and both modalities modeled with Gaussian likelihoods over multi-channel LFP.
+    """
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    torch.manual_seed(my_seed)
+
+    # MOVE MODELS TO DEVICE HERE
+    net_encode.to(device)
+    net_decode.to(device)
+    n_encode.to(device)
+    n_decode.to(device)
+
+    print("N_lats_img =", N_lats_img)
+    print("N_lats_spikes =", N_lats_spikes)
+    print("N_shared =", N_shared)
+
+
+    # N_tot is how many total latents across both modalities (shared + private)
+    N_tot = N_lats_img + N_lats_spikes - N_shared
+
+    # make all params trainable
+    for param in n_encode.parameters():
+        param.requires_grad = True
+    for param in n_decode.parameters():
+        param.requires_grad = True
+    for param in net_encode.parameters():
+        param.requires_grad = True
+    for param in net_decode.parameters():
+        param.requires_grad = True
+
+    optimizer_behave_encode = torch.optim.Adam(net_encode.parameters(), lr=lr1)
+    optimizer_behave_decode = torch.optim.Adam(net_decode.parameters(), lr=lr2)
+    optimizer_n_encode      = torch.optim.Adam(n_encode.parameters(),      lr=lr3)
+    optimizer_n_decode      = torch.optim.Adam(n_decode.parameters(),      lr=lr4)
+
+    losses = []
+    max_grad_norm = 1
+
+    for epoch in range(EPOCH):
+        trainloss = 0.0
+
+        # *** KEY CHANGE: only two items from the loader ***
+        for data_region1, data_region2 in data_load:
+
+            optimizer_behave_encode.zero_grad()
+            optimizer_behave_decode.zero_grad()
+            optimizer_n_encode.zero_grad()
+            optimizer_n_decode.zero_grad()
+
+            net_encode.train()
+            net_decode.train()
+            n_decode.train()
+            n_encode.train()
+
+            # map to original variable names in their code:
+            # "data" ~ first modality (was image/behavior), now region 1
+            # "spikes" ~ second modality (was spikes), now region 2
+            data   = data_region1.to(device)  # (B, C, T) or (B, T, C)
+            spikes = data_region2.to(device)
+
+            B = data.shape[0]
+
+            # noise for reparameterization
+            eps   = torch.randn(B, N_lats_img,   device=device)
+            eps_n = torch.randn(B, N_lats_spikes, device=device)
+
+            # encode latents in time domain
+            embs_m_n,   embs_s_n   = n_encode(spikes.float(), Fourier=Fourier)
+            embs_m_img, embs_s_img = net_encode(data.float(),  Fourier=Fourier)
+
+            # (for now, assume Fourier=False; see note below)
+            # -> embs_* already in time domain
+
+            # # combine latents into shared + private blocks
+            # z_m_tot, z_s_tot = return_partitioned_latents(
+            #     neural_embeds_m = embs_m_n,
+            #     image_embeds_m  = embs_m_img,
+            #     neural_embeds_s = embs_s_n,
+            #     image_embeds_s  = embs_s_img,
+            #     N_lats_spikes   = N_lats_spikes,
+            #     N_lats_img      = N_lats_img,
+            #     N_shared        = N_shared
+            # )
+
+            # # sample z_tot from q(z | x1, x2)
+            # z_tot = net_encode.sample(z_m_tot, z_s_tot, eps)
+
+            # # penalty on variance (same as their code)
+            # pen_term = -z_s_tot.sum([1, 2])
+
+            # # GP prior
+            # K_cov = net_encode.gp_make_cov(eps=1e-2, Fourier=Fourier)
+            # gpNLL = gp_nll(K_cov, (z_m_tot + torch.exp(z_s_tot)), Fourier=Fourier)
+
+            # combine latents into shared + private blocks
+            z_m_tot, z_logvar_tot = return_partitioned_latents(
+                neural_embeds_m = embs_m_n,
+                image_embeds_m  = embs_m_img,
+                neural_embeds_s = embs_s_n,
+                image_embeds_s  = embs_s_img,
+                N_lats_spikes   = N_lats_spikes,
+                N_lats_img      = N_lats_img,
+                N_shared        = N_shared
+            )
+
+            # sample z_tot from q(z | x1, x2) using a generic reparameterization
+            z_tot = sample_latents(z_m_tot, z_logvar_tot)
+
+            # penalty term: same structure as original (they used z_s_tot)
+            pen_term = -z_logvar_tot.sum([1, 2])
+
+            # GP prior: build covariance over time using our helper
+            K_cov = gp_make_cov_time(TIME_POINTS, len_sc=30.0, eps=1e-2, device=device)
+
+            # GP NLL: same call signature as their code
+            # gpNLL = gp_nll(K_cov, (z_m_tot + torch.exp(z_logvar_tot)), Fourier=Fourier)
+            gpNLL = gp_nll(K_cov, z_m_tot + torch.exp(0.5 * z_logvar_tot), Fourier=False)
+            ######make sure z_m_tot + exp(0.5*z_logvar_tot) → (B, T, N_tot), If gp_nll expects (T,N_tot), then you need to apply it per batch.
+
+
+            # ----- IMPORTANT: define "time-domain" latents for Fourier=False -----
+            # In their original code, for Fourier=True they map with Time_lat_conv.
+            # Here, we treat z_m_tot as already time-domain.
+            z_tot_time    = z_tot                      # (B, T, N_tot)
+            z_m_tot_time  = z_m_tot[:, :, :N_lats_spikes]  # neural block
+
+            # # LFP Gaussian decoder for region 2
+            # neural_loss, _ = n_decode(z_m_tot_time, spikes)
+
+            # # region 1 reconstruction using net_decode (must be adapted for LFP)
+            # _, recon_term = net_decode(z=z_tot_time[:, :, -(N_lats_img):],
+            #                            x=data,
+            #                            Fourier=Fourier)
+
+            # LFP Gaussian decoder for region 2 (modality 2)
+            neural_loss, _ = n_decode(z_m_tot_time, spikes)
+
+            # region 1 reconstruction using net_decode (modality 1)
+            recon_term, _ = net_decode(z=z_tot_time[:, :, -(N_lats_img):],
+                                    lfp=data,
+                                    Fourier=Fourier)
+
+
+            ELBO = (pen_term + neural_loss + recon_term + gpNLL).sum()
+            loss = ELBO / BATCH
+            trainloss += loss.item()
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(n_decode.parameters(),   max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(n_encode.parameters(),   max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(net_encode.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(net_decode.parameters(), max_grad_norm)
+
+            optimizer_behave_encode.step()
+            optimizer_behave_decode.step()
+            optimizer_n_encode.step()
+            optimizer_n_decode.step()
+
+        trainloss /= len(data_load)
+        losses.append(trainloss)
+        if epoch % 50 == 0:
+            print(f'Epoch {epoch} | Loss: {trainloss:.2f}')
+
+    if visualize_ELBO:
+        plt.figure(figsize=(5, 3), dpi=150)
+        plt.title('ELBO')
+        plt.plot(losses)
+        plt.xlabel('Number of epochs')
+        plt.ylabel('Loss')
+        plt.show()
+
+    return losses
