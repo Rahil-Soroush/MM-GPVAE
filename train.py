@@ -1379,6 +1379,9 @@ def gp_make_cov_time(T, len_sc=30.0, eps=1e-4, device=None):
 
 def train_mmgpvae_two_region(net_encode, net_decode, n_encode, n_decode, data_load,
                              EPOCH=650, lr1=0.00016, lr2=0.00016, lr3=0.000772, lr4=0.0088,
+                             w_recon=1.0,
+                             w_gp=0.01,
+                             w_pen=0.001,
                              Fourier=False, visualize_ELBO=True):
     """
     The training loop:
@@ -1542,8 +1545,14 @@ def train_mmgpvae_two_region(net_encode, net_decode, n_encode, n_decode, data_lo
                                     lfp=data,
                                     Fourier=Fourier)
 
+            total = (
+                w_pen  * pen_term +
+                w_recon * (neural_loss + recon_term) +
+                w_gp   * gpNLL
+            )
 
-            ELBO = (pen_term + neural_loss + recon_term + gpNLL).sum()
+            ELBO = total.sum()
+            # ELBO = (pen_term + neural_loss + recon_term + gpNLL).sum()
             loss = ELBO / BATCH
             trainloss += loss.item()
 
